@@ -1320,7 +1320,18 @@ class FrameProcessor(BaseObject):
 
             self.__process_current_frame = frame
 
-            if self.__should_block_frames and self.__process_event:
+            # The pause holds back text on its way to synthesis, so it applies
+            # downstream only. Upstream frames must keep flowing while a
+            # service speaks: the assistant aggregator sits after the output
+            # transport, and the LLMContextFrame it pushes upstream after a
+            # function-call result is what starts the next inference. Gating
+            # that on the current utterance finishing delays every reply that
+            # follows a tool call by the length of the audio still playing.
+            if (
+                self.__should_block_frames
+                and self.__process_event
+                and direction == FrameDirection.DOWNSTREAM
+            ):
                 logger.trace(f"{self}: frame processing paused")
                 await self.__process_event.wait()
                 self.__process_event.clear()

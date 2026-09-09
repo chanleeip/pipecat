@@ -35,6 +35,12 @@ from tests.frame_processor_helpers import frame_processor_setup
 
 
 @dataclass
+class UpstreamProbeFrame(DataFrame):
+    """Marker pushed upstream from behind a paused processor."""
+
+
+
+@dataclass
 class BroadcastTestFrame(DataFrame):
     """Test frame with init fields for broadcast testing."""
 
@@ -625,6 +631,76 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(processed, ["StartFrame", "UserStartedSpeakingFrame", "TextFrame"])
         finally:
             await processor.cleanup()
+
+
+class TestPauseIsDownstreamOnly(unittest.IsolatedAsyncioTestCase):
+    """A paused processor still forwards upstream frames.
+
+    Pausing holds text back from synthesis, which is a downstream concern. The
+    frame that starts the next inference travels upstream from the aggregator
+    that sits after the output transport, so it must not wait on the audio
+    currently playing.
+    """
+
+    async def test_upstream_frame_passes_a_paused_processor(self):
+        RESUME_AFTER = 0.5
+        timing = {}
+
+        class PausingProcessor(FrameProcessor):
+            """Pauses on speech and resumes when that speech finishes, like a TTS."""
+
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
+                    await self.pause_processing_frames()
+                    timing["paused_at"] = asyncio.get_running_loop().time()
+                    # Stand in for the audio finishing. The probe must arrive
+                    # before this, otherwise it waited on the utterance.
+                    async def _resume():
+                        await asyncio.sleep(RESUME_AFTER)
+                        await self.resume_processing_frames()
+
+                    asyncio.create_task(_resume())
+                await self.push_frame(frame, direction)
+
+        class UpstreamOnSpeech(FrameProcessor):
+            """Stands in for the assistant aggregator after the transport."""
+
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                await self.push_frame(frame, direction)
+                if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
+                    await self.push_frame(UpstreamProbeFrame(), FrameDirection.UPSTREAM)
+
+        class ProbeWatcher(FrameProcessor):
+            """Sits above the pause and records when the probe gets through."""
+
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, UpstreamProbeFrame):
+                    timing.setdefault(
+                        "probe_at", asyncio.get_running_loop().time()
+                    )
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline([ProbeWatcher(), PausingProcessor(), UpstreamOnSpeech()])
+
+        await run_test(
+            pipeline,
+            frames_to_send=[TextFrame(text="speaking"), SleepFrame(sleep=0.8)],
+            expected_up_frames=[UpstreamProbeFrame],
+        )
+
+        self.assertIn("probe_at", timing, "upstream frame never arrived")
+        # Arrival alone proves nothing: the probe also lands once the pause
+        # lifts. It must cross *while* the processor is still paused.
+        waited = timing["probe_at"] - timing["paused_at"]
+        self.assertLess(
+            waited,
+            RESUME_AFTER / 2,
+            f"upstream frame waited {waited:.2f}s -- it was held by the "
+            f"downstream pause until the utterance finished",
+        )
 
 
 if __name__ == "__main__":
