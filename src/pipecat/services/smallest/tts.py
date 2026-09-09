@@ -150,6 +150,7 @@ class SmallestTTSService(InterruptibleTTSService):
         sample_rate: int | None = None,
         output_format: str = "pcm",
         word_timestamps: bool = True,
+        continuations: bool = True,
         max_buffer_delay_ms: int | None = None,
         settings: Settings | None = None,
         **kwargs,
@@ -171,9 +172,18 @@ class SmallestTTSService(InterruptibleTTSService):
                 voices silently emit no word events, so leaving this on is safe
                 regardless of voice. Fixed at init time because it determines
                 whether text frames are produced from word timing or pushed whole.
+            continuations: Whether fragments within a turn share a continuation
+                context so the server joins them into one generation instead of
+                resetting prosody per fragment. Enabled by default. Set ``False``
+                to fall back to independent per-fragment requests -- the behaviour
+                before continuations, kept as an escape hatch because the server
+                may report word timestamps relative to the context rather than the
+                request once fragments are joined (see
+                ``_advance_word_timestamp_request``).
             max_buffer_delay_ms: Upper bound, in milliseconds (0-5000), on how long
                 the server buffers a continuation fragment before speaking it. If
-                None, the server's default (3000ms) applies.
+                None, the server's default (3000ms) applies. Ignored when
+                ``continuations`` is False.
             settings: Runtime-updatable settings for the TTS service.
             **kwargs: Additional arguments passed to parent InterruptibleTTSService.
         """
@@ -212,6 +222,7 @@ class SmallestTTSService(InterruptibleTTSService):
         self._base_url = base_url.rstrip("/")
         self._output_format = output_format
         self._word_timestamps = word_timestamps
+        self._continuations = continuations
         self._max_buffer_delay_ms = max_buffer_delay_ms
         self._receive_task = None
         self._keepalive_task = None
@@ -244,6 +255,8 @@ class SmallestTTSService(InterruptibleTTSService):
             context_id: The context to flush. If None, falls back to the
                 currently active context.
         """
+        if not self._continuations:
+            return
         flush_id = context_id or self.get_active_audio_context_id()
         if not flush_id or not self._websocket:
             return
@@ -283,9 +296,11 @@ class SmallestTTSService(InterruptibleTTSService):
             "model": self._settings.model,
             "language": self._settings.language,
             "sample_rate": self.sample_rate,
-            "context_id": context_id,
-            "continue": continue_transcript,
         }
+
+        if self._continuations:
+            msg["context_id"] = context_id
+            msg["continue"] = continue_transcript
 
         if self._settings.speed is not None:
             msg["speed"] = self._settings.speed
@@ -296,7 +311,7 @@ class SmallestTTSService(InterruptibleTTSService):
         if self._word_timestamps:
             msg["word_timestamps"] = True
 
-        if self._max_buffer_delay_ms is not None:
+        if self._continuations and self._max_buffer_delay_ms is not None:
             msg["max_buffer_delay_ms"] = self._max_buffer_delay_ms
 
         msg["output_format"] = self._output_format
