@@ -77,6 +77,99 @@ def test_word_timestamps_disabled_pushes_whole_text():
     assert "word_timestamps" not in service._build_msg("hi")
 
 
+def test_build_msg_defaults_to_continuing_context():
+    """Without an explicit override, a fragment continues its context."""
+    service = _make_service()
+    msg = service._build_msg("hi", context_id=CTX)
+    assert msg["context_id"] == CTX
+    assert msg["continue"] is True
+
+
+def test_build_msg_can_close_context():
+    """`continue_transcript=False` marks the fragment as the last one."""
+    service = _make_service()
+    msg = service._build_msg("hi", context_id=CTX, continue_transcript=False)
+    assert msg["continue"] is False
+
+
+def test_build_msg_omits_buffer_delay_by_default():
+    """The server's own default buffering window applies unless overridden."""
+    service = _make_service()
+    assert "max_buffer_delay_ms" not in service._build_msg("hi")
+
+
+def test_build_msg_includes_buffer_delay_when_set():
+    service = SmallestTTSService(api_key="test-key", max_buffer_delay_ms=1500)
+    assert service._build_msg("hi")["max_buffer_delay_ms"] == 1500
+
+
+def test_continuations_disabled_omits_context_fields():
+    """The escape hatch restores independent per-fragment requests."""
+    service = SmallestTTSService(
+        api_key="test-key", continuations=False, max_buffer_delay_ms=1500
+    )
+    msg = service._build_msg("hi", context_id=CTX)
+    assert "context_id" not in msg
+    assert "continue" not in msg
+    assert "max_buffer_delay_ms" not in msg
+
+
+@pytest.mark.asyncio
+async def test_flush_audio_closes_the_active_context():
+    """flush_audio sends an empty, `continue: false` fragment for the context."""
+    service = _make_service()
+
+    sent = []
+
+    class FakeWebsocket:
+        state = None  # unused by flush_audio
+
+        async def send(self, data):
+            sent.append(json.loads(data))
+
+    service._websocket = FakeWebsocket()
+    service.get_active_audio_context_id = lambda: CTX
+
+    await service.flush_audio()
+
+    assert len(sent) == 1
+    assert sent[0]["context_id"] == CTX
+    assert sent[0]["continue"] is False
+    assert sent[0]["text"] == ""
+
+
+@pytest.mark.asyncio
+async def test_flush_audio_is_a_noop_without_a_connection():
+    """No message is sent if the websocket isn't connected."""
+    service = _make_service()
+    service._websocket = None
+    service.get_active_audio_context_id = lambda: CTX
+
+    # Should not raise even though there's nowhere to send.
+    await service.flush_audio()
+
+
+@pytest.mark.asyncio
+async def test_flush_audio_is_a_noop_when_continuations_are_off():
+    """With continuations disabled, turn end must not send a close fragment."""
+    service = SmallestTTSService(api_key="test-key", continuations=False)
+
+    sent = []
+
+    class FakeWebsocket:
+        state = None
+
+        async def send(self, data):
+            sent.append(json.loads(data))
+
+    service._websocket = FakeWebsocket()
+    service.get_active_audio_context_id = lambda: CTX
+
+    await service.flush_audio()
+
+    assert sent == []
+
+
 async def _drive(service: SmallestTTSService, messages):
     """Run _receive_messages over a scripted stream, capturing word timestamps."""
     captured = []
