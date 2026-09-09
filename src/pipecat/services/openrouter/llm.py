@@ -23,9 +23,19 @@ from pipecat.utils.types import assert_given
 
 @dataclass
 class OpenRouterLLMSettings(BaseOpenAILLMService.Settings):
-    """Settings for OpenRouterLLMService."""
+    """Settings for OpenRouterLLMService.
 
-    pass
+    Parameters:
+        provider_only: Route exclusively to these OpenRouter providers, by name
+            (e.g. ``["Groq"]``), with fallbacks disabled. A model served by
+            several providers otherwise lands on whichever one OpenRouter picks,
+            and they differ in both latency and quantisation -- the same model
+            can be several times slower and measurably worse at tool calling
+            depending on the host. Requests fail rather than silently reroute
+            when the named providers are unavailable.
+    """
+
+    provider_only: list[str] | None = None
 
 
 class OpenRouterLLMService(OpenAILLMService):
@@ -111,6 +121,18 @@ class OpenRouterLLMService(OpenAILLMService):
             Transformed parameters ready for the API call.
         """
         params = super().build_chat_completion_params(params_from_context)
+
+        # `provider` is an OpenRouter routing directive the OpenAI SDK does not
+        # know, so it travels in extra_body.
+        if self._settings.provider_only:
+            params["extra_body"] = {
+                **params.get("extra_body", {}),
+                "provider": {
+                    "only": list(self._settings.provider_only),
+                    "allow_fallbacks": False,
+                },
+            }
+
         model = assert_given(self._settings.model)
         if model is not None and "gemini" in model.lower():
             messages = params.get("messages", [])
