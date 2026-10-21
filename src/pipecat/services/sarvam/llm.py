@@ -228,12 +228,14 @@ class SarvamLLMService(OpenAILLMService):
         if extra_body:
             params.setdefault("extra_body", {}).update(extra_body)
 
-        if (
-            model in self._REASONING_MODELS
-            and is_given(self._settings.reasoning_effort)
-            and self._settings.reasoning_effort is not None
-        ):
-            params["reasoning_effort"] = self._settings.reasoning_effort
+        if model in self._REASONING_MODELS and is_given(self._settings.reasoning_effort):
+            if self._settings.reasoning_effort is not None:
+                params["reasoning_effort"] = self._settings.reasoning_effort
+            else:
+                # Sarvam reasons by default, and the reasoning tokens eat the
+                # latency budget. Omitting the field leaves that default on;
+                # only an explicit null turns it off.
+                params.setdefault("extra_body", {})["reasoning_effort"] = None
 
         return params
 
