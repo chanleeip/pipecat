@@ -48,7 +48,7 @@ class SarvamLLMService(OpenAILLMService):
     # This value is used by BaseOpenAILLMService when calling the adapter.
     supports_developer_role = False
 
-    _SUPPORTED_MODELS = frozenset({"sarvam-105b"})
+    _SUPPORTED_MODELS = frozenset({"sarvam-105b", "sarvam-105b-conversations"})
     Settings = SarvamLLMSettings
     _settings: Settings
 
@@ -139,11 +139,17 @@ class SarvamLLMService(OpenAILLMService):
 
         if is_given(self._settings.wiki_grounding) and self._settings.wiki_grounding is not None:
             params["wiki_grounding"] = self._settings.wiki_grounding
-        if (
-            is_given(self._settings.reasoning_effort)
-            and self._settings.reasoning_effort is not None
-        ):
-            params["reasoning_effort"] = self._settings.reasoning_effort
+        if is_given(self._settings.reasoning_effort):
+            if self._settings.reasoning_effort is not None:
+                params["reasoning_effort"] = self._settings.reasoning_effort
+            else:
+                # Sarvam reasons by default, and the reasoning tokens eat the
+                # latency budget. Omitting the field leaves that default on;
+                # only an explicit null turns it off.
+                params["extra_body"] = {
+                    **params.get("extra_body", {}),
+                    "reasoning_effort": None,
+                }
 
         return params
 
