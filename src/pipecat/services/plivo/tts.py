@@ -7,14 +7,14 @@
 """Plivo Koyal text-to-speech service implementation.
 
 WebSocket integration with Plivo's realtime TTS API
-(``wss://api.plivo.com/v1/Account/{auth_id}/TTS/Realtime/``). Each ``run_tts()``
-call opens one Plivo reply (``context_id``) and closes it with ``finish: true``.
-Consecutive replies on a connection continue each other's prosody server-side.
+(``wss://api.plivo.com/v1/Account/{auth_id}/TTS/Realtime/``). All text of one
+bot turn goes into a single Plivo reply (``context_id``): Plivo generates
+separate replies concurrently and interleaves their audio, so one reply per
+turn is what keeps sentences in order.
 """
 
 import base64
 import json
-import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
@@ -139,9 +139,8 @@ class PlivoTTSService(InterruptibleTTSService):
         self._auth_token = auth_token
         self._base_url = base_url.rstrip("/")
         self._receive_task = None
-        # Plivo never lets a context_id be reused on a connection, so each
-        # run_tts() call gets its own.
-        self._reply_seq = 0
+        # Turn contexts that already have an open Plivo reply on this connection.
+        self._open_contexts: set[str] = set()
 
     def can_generate_metrics(self) -> bool:
         """Return True; this service reports TTFB and usage metrics."""
@@ -154,26 +153,36 @@ class PlivoTTSService(InterruptibleTTSService):
     def _build_websocket_url(self) -> str:
         return f"{self._base_url}/v1/Account/{self._auth_id}/TTS/Realtime/"
 
-    def _build_text_msg(self, text: str, plivo_context_id: str) -> dict:
+    def _build_text_msg(self, text: str, context_id: str, first: bool) -> dict:
+        msg = {"type": "text", "context_id": context_id, "text": text, "finish": False}
+        if not first:
+            return msg
         if self.sample_rate not in _SUPPORTED_SAMPLE_RATES:
             raise ValueError(f"Koyal does not support sample rate {self.sample_rate}")
-        msg = {
-            "type": "text",
-            "context_id": plivo_context_id,
-            "voice_id": self._settings.voice,
-            "text": text,
-            "finish": True,
-            "model_id": self._settings.model or KOYAL_MODEL,
-            "language": self._settings.language_code or "auto",
-            "output_format": {
-                "container": "raw",
-                "encoding": "pcm_s16le",
-                "sample_rate": self.sample_rate,
-            },
-        }
+        msg.update(
+            {
+                "voice_id": self._settings.voice,
+                "model_id": self._settings.model or KOYAL_MODEL,
+                "language": self._settings.language_code or "auto",
+                "output_format": {
+                    "container": "raw",
+                    "encoding": "pcm_s16le",
+                    "sample_rate": self.sample_rate,
+                },
+            }
+        )
         if self._settings.pace is not None:
             msg["pace"] = self._settings.pace
         return msg
+
+    async def flush_audio(self, context_id: str | None = None):
+        """Finish the turn's Plivo reply so it reports completion."""
+        ctx = context_id or self.get_active_audio_context_id()
+        if not ctx or ctx not in self._open_contexts or not self._websocket:
+            return
+        self._open_contexts.discard(ctx)
+        msg = {"type": "text", "context_id": ctx, "text": " ", "finish": True}
+        await self._get_websocket().send(json.dumps(msg))
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the service and open the socket."""
@@ -198,6 +207,7 @@ class PlivoTTSService(InterruptibleTTSService):
 
     async def _disconnect(self):
         await super()._disconnect()
+        self._open_contexts.clear()
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
@@ -279,10 +289,14 @@ class PlivoTTSService(InterruptibleTTSService):
                 await self._connect()
 
             try:
-                self._reply_seq += 1
-                plivo_context_id = f"{uuid.uuid4().hex[:12]}-{self._reply_seq}"
-                msg = self._build_text_msg(text, plivo_context_id)
-                await self._get_websocket().send(json.dumps(msg))
+                first = context_id not in self._open_contexts
+                fragment = text if first else " " + text
+                msg = self._build_text_msg(fragment, context_id, first)
+                ws = self._get_websocket()
+                await ws.send(json.dumps(msg))
+                self._open_contexts.add(context_id)
+                # Speak the fragment now instead of waiting for more text.
+                await ws.send(json.dumps({"type": "flush", "context_id": context_id}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
                 yield ErrorFrame(error=f"Plivo TTS send error: {e}")
