@@ -26,6 +26,7 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.services.deepgram._errors import describe_refusal
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService, WebsocketTTSService
 from pipecat.utils.text.phonemes import ipa_phones, normalize_ipa, stress_before_vowels
@@ -270,17 +271,21 @@ class DeepgramTTSService(WebsocketTTSService):
             self._websocket = websocket
 
             # `response` is populated after the handshake completes (which it
-            # has, since the connect call already returned).
-            response_headers = websocket.response.headers if websocket.response else {}
-            headers = {k: v for k, v in response_headers.items() if k.startswith("dg-")}
+            # has, since the connect call already returned). `raw_items`, because
+            # the mapping view raises on a repeated header, such as the pair of
+            # Set-Cookie a load balancer adds.
+            response_headers = websocket.response.headers.raw_items() if websocket.response else []
+            headers = {k: v for k, v in response_headers if k.lower().startswith("dg-")}
             logger.debug(f'{self}: Websocket connection initialized: {{"headers": {headers}}}')
 
             await self._call_event_handler("on_connected")
         except Exception as e:
-            logger.error(f"{self} exception: {e}")
-            await self.push_error_frame(ErrorFrame(error=f"{self} error: {e}", exception=e))
+            refusal = describe_refusal(e)
+            await self.push_error_frame(
+                ErrorFrame(error=refusal or f"{self} error: {e}", exception=e)
+            )
             self._websocket = None
-            await self._call_event_handler("on_connection_error", f"{e}")
+            await self._call_event_handler("on_connection_error", refusal or f"{e}")
 
     async def _disconnect_websocket(self):
         """Close WebSocket connection and reset state."""
@@ -545,21 +550,14 @@ class DeepgramHttpTTSService(TTSService):
 
                 await self.start_tts_usage_metrics(text)
 
-                CHUNK_SIZE = self.chunk_size
-
-                first_chunk = True
-                async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                    if first_chunk:
-                        await self.stop_ttfb_metrics()
-                        first_chunk = False
-
-                    if chunk:
-                        yield TTSAudioRawFrame(
-                            audio=chunk,
-                            sample_rate=self.sample_rate,
-                            num_channels=1,
-                            context_id=context_id,
-                        )
+                # HTTP chunk boundaries can fall mid-sample, so let the iterator
+                # helper keep emitted frames sample-aligned.
+                async for frame in self._stream_audio_frames_from_iterator(
+                    response.content.iter_chunked(self.chunk_size),
+                    context_id=context_id,
+                ):
+                    await self.stop_ttfb_metrics()
+                    yield frame
 
         except Exception as e:
             yield ErrorFrame(f"Error getting audio: {str(e)}")

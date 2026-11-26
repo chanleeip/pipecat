@@ -6,8 +6,9 @@
 
 """Tests for Dograh-managed AI services."""
 
+import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs
 
 import pytest
@@ -53,7 +54,7 @@ class _OpenWebsocket:
 def test_flux_default_query_omits_unset_options_and_preserves_billing():
     service = DograhFluxSTTService(api_key="test-key", correlation_id="call-123")
 
-    query = parse_qs(service._build_dograh_query_string())
+    query = parse_qs(service._build_query_string())
 
     assert "profanity_filter" not in query
     assert "redact" not in query
@@ -184,6 +185,64 @@ async def test_tts_usage_is_not_billed_again_when_context_finishes():
     service.start_tts_usage_metrics.assert_awaited_once_with("hello")
 
 
+class _ErrorWebsocket:
+    def __init__(self, message):
+        self._message = message
+        self.close = AsyncMock()
+
+    async def __aiter__(self):
+        yield json.dumps(self._message)
+
+
+def _tts_receiving(message):
+    service = DograhTTSService(api_key="test-key")
+    service._websocket = _ErrorWebsocket(message)
+    service.push_frame = AsyncMock()
+    service.push_error = AsyncMock()
+    service.stop_all_metrics = AsyncMock()
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "error_msg"),
+    [
+        (
+            {"type": "error", "error": "voice_not_found", "message": "Voice 'abc' not found"},
+            "TTS service voice not found: Voice 'abc' not found",
+        ),
+        (
+            {"type": "error", "error": "quota_exceeded", "message": "Quota exceeded"},
+            "TTS service quota exceeded: Quota exceeded",
+        ),
+    ],
+)
+async def test_tts_errors_every_reconnect_would_repeat_are_permanent(message, error_msg):
+    service = _tts_receiving(message)
+    websocket = service._websocket
+    keepalive = service._keepalive_task = object()
+    service.cancel_task = AsyncMock()
+
+    with pytest.raises(asyncio.CancelledError):
+        await service._receive_messages()
+
+    service.push_error.assert_awaited_once_with(error_msg=error_msg, force_treat_as_permanent=True)
+    service.cancel_task.assert_awaited_once_with(keepalive)
+    assert service._keepalive_task is None
+    websocket.close.assert_awaited_once()
+    assert service._websocket is None
+
+
+@pytest.mark.asyncio
+async def test_tts_other_errors_are_raised_for_reconnect():
+    service = _tts_receiving({"type": "error", "message": "Upstream timed out"})
+
+    with pytest.raises(Exception, match="Dograh TTS error: Upstream timed out"):
+        await service._receive_messages()
+
+    service.push_error.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_tts_terminal_context_ids_do_not_grow_after_context_cleanup():
     service = DograhTTSService(api_key="test-key")
@@ -212,6 +271,41 @@ async def test_flux_disconnect_discards_configure_state_from_old_connection():
     assert service._configure_in_flight is False
     assert service._configure_sent_at is None
     assert service._configure_pending_fields is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnecting", [False, True])
+async def test_flux_closed_connection_finishes_partial_turn_unless_stopping(disconnecting):
+    service = DograhFluxSTTService(api_key="test-key")
+    service._websocket = MagicMock()
+
+    async def empty_messages():
+        if False:
+            yield
+
+    service._websocket.__aiter__.side_effect = empty_messages
+    service._disconnecting = disconnecting
+    service._connection_established_event.set()
+    service._watchdog_task = MagicMock()
+    service._watchdog_task.done.return_value = False
+    service._user_is_speaking = True
+    service._turn_transcript = "I would like"
+    service.push_frame = AsyncMock()
+    service.broadcast_frame = AsyncMock()
+    service.emit_stt_usage_metrics = AsyncMock()
+
+    await service._receive_messages()
+
+    if disconnecting:
+        service.push_frame.assert_not_awaited()
+        service.broadcast_frame.assert_not_awaited()
+    else:
+        frame = service.push_frame.await_args.args[0]
+        assert isinstance(frame, TranscriptionFrame)
+        assert frame.text == "I would like"
+        assert frame.finalized is False
+        service.broadcast_frame.assert_awaited_once_with(ProposedUserStoppedSpeakingFrame)
+        assert not service._user_is_speaking
 
 
 @pytest.mark.asyncio
